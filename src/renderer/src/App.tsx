@@ -7,7 +7,7 @@ import { FileRow, type FileItem } from './components/FileList'
 import { OutputLocation, TypeSelector, type Options } from './components/OptionsPanel'
 import { AnonymoMark, Button, ShanoonMark } from './components/ui'
 
-const SUPPORTED = new Set(['pdf', 'docx', 'xlsx', 'xlsm'])
+const SUPPORTED = new Set(['pdf', 'docx', 'xlsx', 'xlsm', 'jpg', 'jpeg', 'png'])
 
 function toItem(path: string): FileItem {
   const name = path.split(/[\\/]/).pop() ?? path

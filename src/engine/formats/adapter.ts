@@ -12,11 +12,13 @@ export interface DocumentAdapter {
   warnings?: string[]
 }
 
-export type SupportedKind = 'pdf' | 'docx' | 'xlsx'
+export type SupportedKind = 'pdf' | 'docx' | 'xlsx' | 'png' | 'jpg'
 
 export function kindFromName(name: string): SupportedKind | null {
   const ext = name.toLowerCase().split('.').pop()
   if (ext === 'pdf' || ext === 'docx' || ext === 'xlsx') return ext
   if (ext === 'xlsm') return 'xlsx'
+  if (ext === 'png') return 'png'
+  if (ext === 'jpg' || ext === 'jpeg') return 'jpg'
   return null
 }

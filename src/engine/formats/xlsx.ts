@@ -7,6 +7,7 @@ import {
   decodeXml,
   DRAWING_SCAN,
   encodeXml,
+  imagesRemovedWarning,
   OoxmlPackage,
   paragraphEdits,
   paragraphText,
@@ -92,6 +93,11 @@ export async function loadXlsx(buf: Uint8Array): Promise<DocumentAdapter> {
   const warnings: string[] = []
 
   await pkg.scrubDocProps()
+  // Logos and signatures: the pictures go, their frames stay with a placeholder (alt text "[OBRAZOK]").
+  const images = await pkg.removeImages()
+  await pkg.labelPictures(/^xl\/drawings\/.*\.xml$/, /<xdr:pic\b[\s\S]*?<\/xdr:pic>/g)
+  await pkg.replaceAttrs(/^xl\/drawings\/.*\.vml$/, ['o:title'], '')
+  if (images) warnings.push(imagesRemovedWarning(images))
   // Comment authors / threaded-comment people
   for (const f of pkg.files(/^xl\/comments\d*\.xml$/)) {
     const xml = await pkg.read(f)

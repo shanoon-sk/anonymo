@@ -6,6 +6,7 @@ import { kindFromName } from './formats/adapter'
 import { loadDocx } from './formats/docx'
 import { loadXlsx } from './formats/xlsx'
 import { loadPdf, type OcrFn } from './formats/pdf'
+import { loadImage } from './formats/image'
 import { anonymizeBatch, type NerFn } from './pipeline'
 
 export interface Engines {
@@ -55,21 +56,23 @@ export async function processFiles(
     onProgress({ input, stage: 'reading', progress: 0 })
     try {
       const kind = kindFromName(input)
-      if (!kind) throw new Error('Nepodporovaný formát. Podporované sú PDF, DOCX a XLSX.')
+      if (!kind) throw new Error('Nepodporovaný formát. Podporované sú PDF, DOCX, XLSX, JPG a PNG.')
       const buf = new Uint8Array(await readFile(input))
       let adapter: DocumentAdapter
       if (kind === 'docx') adapter = await loadDocx(buf)
       else if (kind === 'xlsx') adapter = await loadXlsx(buf)
       else {
-        adapter = await loadPdf(buf, {
+        const ocrOpts = {
           ocr: engines.ocr
-            ? async (png) => {
+            ? async (png: Uint8Array) => {
                 ocr ??= await engines.ocr!()
                 return ocr(png)
               }
             : undefined,
-          onOcrPage: (i, total) => onProgress({ input, stage: 'ocr', progress: i / total, detail: `${i + 1}/${total}` })
-        })
+          onOcrPage: (i: number, total: number) =>
+            onProgress({ input, stage: 'ocr', progress: i / total, detail: `${i + 1}/${total}` })
+        }
+        adapter = kind === 'pdf' ? await loadPdf(buf, ocrOpts) : await loadImage(buf, kind, ocrOpts)
       }
       loaded.push({ idx, adapter })
       results[idx].ocrPages = adapter.ocrPages ?? 0

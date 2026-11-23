@@ -1,3 +1,4 @@
+import { posix } from 'node:path'
 import JSZip from 'jszip'
 import type { Segment, SegmentResult } from '../types'
 import { applyEntitiesToPieces } from '../rewrite'
@@ -203,6 +204,91 @@ export class OoxmlPackage {
     }
   }
 
+  /**
+   * Logos, signatures and stamps identify the company or person as surely as their name does. Every image
+   * relationship (inline, floating, header/footer, VML, cell pictures, linked URLs) is pointed at one plain
+   * placeholder picture: the frame keeps its size and position, so the layout does not move. Image parts that
+   * nothing references any more and the package thumbnail (a picture of the first page) are deleted.
+   * Returns the number of distinct images removed.
+   */
+  async removeImages(): Promise<number> {
+    const removed = new Set<string>()
+    const placeholders = new Set<string>()
+    const dropped = new Set<string>()
+    for (const relsFile of this.files(RELS_FILE)) {
+      const base = relsFile.replace(/_rels\/[^/]*$/, '') // folder of the part these rels belong to
+      const top = base.split('/')[0]
+      const xml = await this.read(relsFile)
+      let changed = false
+      const out = xml.replace(/<Relationship\b[^>]*?\/>/g, (rel) => {
+        const type = relAttr(rel, 'Type')
+        const target = relAttr(rel, 'Target')
+        const external = /\sTargetMode="External"/.test(rel)
+        if (THUMBNAIL_REL.test(type)) {
+          if (!external) dropped.add(resolvePart(base, target))
+          changed = true
+          return ''
+        }
+        if (!IMAGE_REL.test(type) || !top) return rel
+        let newTarget: string
+        if (external) {
+          removed.add(target)
+          placeholders.add(`${top}/media/${IMAGE_PLACEHOLDER}`)
+          newTarget = posix.relative(base, `${top}/media/${IMAGE_PLACEHOLDER}`)
+        } else {
+          const part = resolvePart(base, target)
+          if (posix.basename(part) === IMAGE_PLACEHOLDER) return rel
+          removed.add(part)
+          placeholders.add(posix.join(posix.dirname(part), IMAGE_PLACEHOLDER))
+          newTarget = target.replace(/[^/]*$/, IMAGE_PLACEHOLDER)
+        }
+        changed = true
+        return rel.replace(/\sTargetMode="External"/, '').replace(/(\sTarget=")[^"]*(")/, `$1${encodeXml(newTarget)}$2`)
+      })
+      if (changed) this.xml.set(relsFile, out)
+    }
+    if (!removed.size && !dropped.size) return 0
+
+    for (const p of placeholders) this.zip.file(p, PLACEHOLDER_PNG)
+    // Delete media nothing points to any more (the originals, and orphans that were never shown).
+    const referenced = new Set<string>()
+    for (const relsFile of this.files(RELS_FILE)) {
+      const base = relsFile.replace(/_rels\/[^/]*$/, '')
+      const xml = this.xml.get(relsFile) ?? (await this.read(relsFile))
+      for (const rel of xml.match(/<Relationship\b[^>]*?\/>/g) ?? [])
+        if (!/\sTargetMode="External"/.test(rel)) referenced.add(resolvePart(base, relAttr(rel, 'Target')))
+    }
+    for (const f of this.files(/(^|\/)media\/[^/]+$/)) if (!referenced.has(f)) dropped.add(f)
+    for (const f of dropped) {
+      this.zip.remove(f)
+      this.xml.delete(f)
+    }
+    const ctFile = '[Content_Types].xml'
+    if (this.zip.file(ctFile)) {
+      let ct = await this.read(ctFile)
+      ct = ct.replace(/<Override\b[^>]*?PartName="\/([^"]*)"[^>]*\/>/g, (o, part: string) => (dropped.has(part) ? '' : o))
+      if (placeholders.size && !/<Default\b[^>]*Extension="png"/i.test(ct))
+        ct = ct.replace(/(<Types\b[^>]*>)/, '$1<Default Extension="png" ContentType="image/png"/>')
+      this.xml.set(ctFile, ct)
+    }
+    return removed.size
+  }
+
+  /** Alt text and title of every picture (`blockRe` matches one picture element) become "[OBRAZOK]". */
+  async labelPictures(fileRe: RegExp, blockRe: RegExp): Promise<void> {
+    for (const f of this.files(fileRe)) {
+      const xml = await this.read(f)
+      const out = xml.replace(blockRe, (block) =>
+        /<a:blip\b/.test(block)
+          ? block.replace(/<(?:wp|xdr|pic):(?:docPr|cNvPr)\b[^>]*>/g, (tag) =>
+              tag.replace(/\s(?:descr|title)="[^"]*"/g, '').replace(/^<([\w:]+)/, `<$1 descr="${IMAGE_LABEL}"`)
+            )
+          : block
+      )
+      if (out !== xml) this.setXml(f, out)
+    }
+  }
+
   async scrubDocProps(): Promise<void> {
     await this.blankElements('docProps/core.xml', [
       'dc:creator', 'cp:lastModifiedBy', 'dc:title', 'dc:subject', 'dc:description', 'cp:keywords', 'cp:category'
@@ -228,6 +314,31 @@ export class OoxmlPackage {
     }
     return this.zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE', compressionOptions: { level: 6 } })
   }
+}
+
+const RELS_FILE = /(^|\/)_rels\/[^/]*\.rels$/
+const IMAGE_REL = /\/relationships\/image$/
+const THUMBNAIL_REL = /\/relationships\/metadata\/thumbnail$/
+export const IMAGE_PLACEHOLDER = 'anonymo.png'
+export const IMAGE_LABEL = '[OBRAZOK]'
+/** 1×1 px in the placeholder box colour (same as the PDF boxes); Word and Excel stretch it to the frame. */
+const PLACEHOLDER_PNG = Uint8Array.from(
+  atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGN49ukDAAWKAsnoBlZ9AAAAAElFTkSuQmCC'),
+  (c) => c.charCodeAt(0)
+)
+
+function relAttr(rel: string, name: string): string {
+  return decodeXml(new RegExp(`\\s${name}="([^"]*)"`).exec(rel)?.[1] ?? '')
+}
+
+/** Package path of a relationship target, relative to the folder of its source part. */
+function resolvePart(base: string, target: string): string {
+  return target.startsWith('/') ? posix.normalize(target.slice(1)) : posix.normalize(posix.join(base, target))
+}
+
+/** The same sentence in every format's report. */
+export function imagesRemovedWarning(n: number): string {
+  return `Odstránené obrázky (logá, podpisy, pečiatky): ${n}.`
 }
 
 /** Hyperlink / external targets in .rels files (mailto:, http…). */

@@ -133,7 +133,7 @@ ipcMain.handle('pick-files', async () => {
     title: 'Vyberte súbory na anonymizáciu',
     properties: ['openFile', 'multiSelections'],
     filters: [
-      { name: 'Dokumenty (PDF, Word, Excel)', extensions: ['pdf', 'docx', 'xlsx', 'xlsm'] },
+      { name: 'Dokumenty a obrázky (PDF, Word, Excel, JPG, PNG)', extensions: ['pdf', 'docx', 'xlsx', 'xlsm', 'jpg', 'jpeg', 'png'] },
       { name: 'Všetky súbory', extensions: ['*'] }
     ]
   })

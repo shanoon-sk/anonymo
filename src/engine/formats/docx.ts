@@ -1,5 +1,5 @@
 import type { DocumentAdapter } from './adapter'
-import { addRelTargets, CHART_SCAN, DRAWING_SCAN, OoxmlPackage, WORD_SCAN } from './ooxml'
+import { addRelTargets, CHART_SCAN, DRAWING_SCAN, imagesRemovedWarning, OoxmlPackage, WORD_SCAN } from './ooxml'
 
 const WORD_TEXT_PARTS = /^word\/(document|header\d*|footer\d*|footnotes|endnotes|comments(Extended)?)\.xml$/
 const AUTHOR_ATTRS = ['w:author', 'w:initials', 'w15:author', 'w15:userId', 'w15:providerId']
@@ -11,6 +11,10 @@ export async function loadDocx(buf: Uint8Array): Promise<DocumentAdapter> {
   // Who edited/commented is personal data too.
   await pkg.replaceAttrs(/^word\/.*\.xml$/, AUTHOR_ATTRS, 'Anonym')
   await pkg.scrubDocProps()
+  // Logos and signatures: the pictures go, their frames stay with a placeholder (alt text "[OBRAZOK]").
+  const images = await pkg.removeImages()
+  await pkg.labelPictures(/^word\/.*\.xml$/, /<wp:(inline|anchor)\b[\s\S]*?<\/wp:\1>/g)
+  await pkg.replaceAttrs(/^word\/.*\.xml$/, ['o:title'], '')
 
   for (const f of pkg.files(WORD_TEXT_PARTS)) await pkg.addParagraphs(f, WORD_SCAN)
   // Text boxes / shapes / SmartArt / charts
@@ -27,6 +31,7 @@ export async function loadDocx(buf: Uint8Array): Promise<DocumentAdapter> {
   return {
     segments: pkg.segments,
     write: (results) => pkg.write(results),
-    outputExt: 'docx'
+    outputExt: 'docx',
+    warnings: images ? [imagesRemovedWarning(images)] : []
   }
 }

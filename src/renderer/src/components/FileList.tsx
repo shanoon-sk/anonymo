@@ -1,4 +1,4 @@
-import { AlertTriangle, CheckCircle2, ExternalLink, FileSpreadsheet, FileText, FolderOpen, Loader2, X } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, ExternalLink, FileImage, FileSpreadsheet, FileText, FolderOpen, Loader2, X } from 'lucide-react'
 import type { EntityType, FileResult, ProgressStage } from '../../../shared/entities'
 import { sk, stageLabel, typeLabel } from '../i18n'
 import { Button, cx } from './ui'
@@ -17,6 +17,8 @@ export interface FileItem {
 function FileIcon({ ext }: { ext: string }) {
   const cls = 'size-5'
   if (ext === 'xlsx' || ext === 'xlsm') return <FileSpreadsheet className={cx(cls, 'text-[#107c41] dark:text-[#4ade80]')} strokeWidth={1.75} />
+  if (ext === 'jpg' || ext === 'jpeg' || ext === 'png')
+    return <FileImage className={cx(cls, 'text-[#0F766E] dark:text-[#5eead4]')} strokeWidth={1.75} />
   if (ext === 'pdf') return <FileText className={cx(cls, 'text-[#dc2626] dark:text-[#f87171]')} strokeWidth={1.75} />
   return <FileText className={cx(cls, 'text-[#2563eb] dark:text-[#60a5fa]')} strokeWidth={1.75} />
 }

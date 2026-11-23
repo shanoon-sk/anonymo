@@ -6,7 +6,7 @@ export const sk = {
   by: 'by Shanoon',
   offlineBadge: '100 % offline',
   dropTitle: 'Pretiahnite sem súbory',
-  dropSubtitle: 'PDF, Word (.docx) alebo Excel (.xlsx)',
+  dropSubtitle: 'PDF, Word (.docx), Excel (.xlsx) alebo obrázok (.jpg, .png)',
   dropOr: 'alebo',
   pickFiles: 'Vybrať súbory',
   dropActive: 'Pustite súbory sem',

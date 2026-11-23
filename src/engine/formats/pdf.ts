@@ -1,6 +1,7 @@
 import type * as MuPDF from 'mupdf'
 import type { ResolvedEntity, SegmentResult } from '../types'
 import type { DocumentAdapter } from './adapter'
+import { IMAGE_LABEL, imagesRemovedWarning } from './ooxml'
 import { BOX_RGB, INK_RGB, labelGeometry, type Overlay, rewritePageInOrder } from './pdf-inorder'
 
 /** A word recognised by OCR, in pixel coordinates of the rendered page image. */
@@ -22,6 +23,15 @@ interface PageText {
   lines: number[]
   ocr: boolean
 }
+
+/** Annotations holding hidden text (comments, attachments) – dropped. */
+const HIDDEN_TEXT_ANNOTS = ['Text', 'Popup', 'FileAttachment', 'Sound']
+/** Annotations that draw a signature or a stamp (macOS Preview, Acrobat Fill & Sign) – dropped like images. */
+const SIGNATURE_ANNOTS = ['Stamp', 'Ink']
+/** An image covering at least this share of the page is the page itself (a scan or a background), not a logo. */
+const PAGE_IMAGE_SHARE = 0.5
+/** Thinner images are rules and borders, not logos or signatures. */
+const MIN_IMAGE_SIDE = 4
 
 const OCR_DPI = 300
 /** A page with less extractable text than this (but with images) is treated as scanned. */
@@ -116,6 +126,124 @@ function entityRects(pt: PageText, e: ResolvedEntity): { line: number; rect: Rec
 const pdfString = (s: string) => '(' + s.replace(/[\\()]/g, (c) => '\\' + c) + ')'
 const n = (x: number) => (Math.round(x * 100) / 100).toString()
 
+/** Prepend `q` and append `Q` + `cs` to the page content, with the given fonts added to its resources. */
+function appendContent(doc: MuPDF.PDFDocument, page: MuPDF.PDFPage, cs: string, fonts: Record<string, MuPDF.PDFObject>) {
+  const pageObj = page.getObject()
+  let res = pageObj.get('Resources')
+  if (res.isNull()) {
+    res = doc.newDictionary()
+    pageObj.put('Resources', res)
+  }
+  let fontDict = res.get('Font')
+  if (fontDict.isNull()) {
+    fontDict = doc.newDictionary()
+    res.put('Font', fontDict)
+  }
+  for (const [name, ref] of Object.entries(fonts)) fontDict.put(name, ref)
+  const contents = pageObj.get('Contents')
+  const arr = doc.newArray()
+  arr.push(doc.addStream('q\n', {}))
+  if (contents.isArray()) contents.forEach((c: MuPDF.PDFObject) => arr.push(c))
+  else if (!contents.isNull()) arr.push(contents)
+  arr.push(doc.addStream('Q\n' + cs, {}))
+  pageObj.put('Contents', arr)
+}
+
+/** Detach a form field (and an emptied parent) from the AcroForm tree, dropping its value. */
+function detachField(root: MuPDF.PDFObject, field: MuPDF.PDFObject) {
+  field.delete('V')
+  const parent = field.get('Parent')
+  const list = parent.isNull() ? root.get('AcroForm').get('Fields') : parent.get('Kids')
+  if (list.isArray())
+    for (let k = list.length - 1; k >= 0; k--) if (list.get(k).isIndirect() && list.get(k).asIndirect() === field.asIndirect()) list.delete(k)
+  if (!parent.isNull() && parent.get('Kids').length === 0) detachField(root, parent)
+}
+
+/**
+ * Logos, signatures and stamps identify the company or person as surely as their name does.
+ * - Signature/stamp annotations and digital signature fields (with the signer's name and certificate) go.
+ * - Hidden-text annotations (notes, attachments) go; the remaining visible ones (FreeText, shapes) are baked
+ *   into the page so their text is anonymized with the rest of it.
+ * - Every image smaller than the page is removed and replaced by a box labelled "[OBRAZOK]".
+ *   A page-sized image is the page itself (scan, background) and stays – reported, because a logo or a
+ *   signature inside it cannot be told apart from the rest of the scan.
+ */
+function removeImagesAndSignatures(mupdf: typeof MuPDF, doc: MuPDF.PDFDocument, warnings: string[]) {
+  const root = doc.getTrailer().get('Root')
+  const count = doc.countPages()
+  let notes = 0
+  let removed = 0
+  for (let i = 0; i < count; i++) {
+    const page = doc.loadPage(i) as MuPDF.PDFPage
+    const annots = page.getAnnotations()
+    for (const a of annots.filter((a) => HIDDEN_TEXT_ANNOTS.includes(a.getType()))) {
+      page.deleteAnnotation(a)
+      notes++
+    }
+    for (const a of annots.filter((a) => SIGNATURE_ANNOTS.includes(a.getType()))) {
+      page.deleteAnnotation(a)
+      removed++
+    }
+    for (const w of page.getWidgets().filter((w) => w.getFieldType() === 'signature')) {
+      detachField(root, w.getObject())
+      page.deleteAnnotation(w)
+      removed++
+    }
+    page.getObject().delete('Thumb') // a small picture of the whole page
+  }
+  const acro = root.get('AcroForm')
+  if (acro.isDictionary() && !(acro.get('Fields').length > 0)) acro.delete('SigFlags')
+  doc.bake(true, false)
+
+  const font = new mupdf.Font('Helvetica')
+  let fontRef: MuPDF.PDFObject | undefined
+  const widthAt1 = (s: string) => [...s].reduce((w, ch) => w + font.advanceGlyph(font.encodeCharacter(ch)), 0)
+  const scans: number[] = []
+  for (let i = 0; i < count; i++) {
+    const page = doc.loadPage(i) as MuPDF.PDFPage
+    const [px0, py0, px1, py1] = page.getBounds()
+    const pageArea = (px1 - px0) * (py1 - py0)
+    const rects: Rect[] = []
+    let pageImage = false
+    page.toStructuredText('preserve-images').walk({
+      onImageBlock(bbox) {
+        const [x0, y0, x1, y1] = bbox as unknown as Rect
+        const w = Math.min(x1, px1) - Math.max(x0, px0)
+        const h = Math.min(y1, py1) - Math.max(y0, py0)
+        if (w <= 0 || h <= 0) return
+        if (w * h >= PAGE_IMAGE_SHARE * pageArea) pageImage = true
+        else if (Math.min(w, h) >= MIN_IMAGE_SIDE) rects.push([x0, y0, x1, y1])
+      }
+    })
+    if (pageImage) scans.push(i + 1)
+    if (!rects.length) continue
+    for (const r of rects) page.createAnnotation('Redact').setRect(r)
+    // Over a page-sized image only the pixels under the box are blanked; otherwise the images are dropped whole.
+    const method = pageImage ? mupdf.PDFPage.REDACT_IMAGE_PIXELS : mupdf.PDFPage.REDACT_IMAGE_REMOVE
+    page.applyRedactions(false, method, mupdf.PDFPage.REDACT_LINE_ART_NONE, mupdf.PDFPage.REDACT_TEXT_NONE)
+    const inv = mupdf.Matrix.invert(page.getTransform())
+    let cs = `q ${inv.map(n).join(' ')} cm\n`
+    for (const rect of rects) cs += boxOps(rect, IMAGE_LABEL, widthAt1)
+    appendContent(doc, page, cs + 'Q\n', { FAnon: (fontRef ??= doc.addSimpleFont(font, 'Latin')) })
+    removed += rects.length
+  }
+  if (notes) warnings.push(`Odstránené poznámky a prílohy v PDF: ${notes}.`)
+  if (removed) warnings.push(imagesRemovedWarning(removed))
+  if (scans.length)
+    warnings.push(
+      `${scans.length === 1 ? 'Strana' : 'Strany'} ${scans.join(', ')}: sken alebo obrázok cez celú stranu – logá a podpisy v ňom sa nedajú spoľahlivo odstrániť, skontrolujte ich.`
+    )
+}
+
+/** Content-stream operators for a placeholder box (page space, inside a y-down `cm`) with its label. */
+function boxOps(rect: Rect, label: string, widthAt1: (s: string) => number): string {
+  const [x0, y0, x1, y1] = rect
+  let cs = `${BOX_RGB.join(' ')} rg ${n(x0)} ${n(y0)} ${n(x1 - x0)} ${n(y1 - y0)} re f\n`
+  if (!label) return cs
+  const g = labelGeometry(rect, label, widthAt1)
+  return cs + `BT 0 Tr /FAnon ${n(g.size)} Tf ${INK_RGB.join(' ')} rg 1 0 0 -1 ${n(g.x)} ${n(g.y)} Tm ${pdfString(label)} Tj ET\n`
+}
+
 export async function loadPdf(buf: Uint8Array, opts: { ocr?: OcrFn; onOcrPage?: (i: number, total: number) => void }): Promise<DocumentAdapter> {
   const mupdf = await loadMupdf()
   const base = mupdf.Document.openDocument(buf, 'application/pdf')
@@ -126,6 +254,8 @@ export async function loadPdf(buf: Uint8Array, opts: { ocr?: OcrFn; onOcrPage?: 
   const pageAt = (i: number) => doc.loadPage(i) as MuPDF.PDFPage
   const warnings: string[] = []
   const count = doc.countPages()
+
+  removeImagesAndSignatures(mupdf, doc, warnings)
   const pages: PageText[] = []
   let ocrPages = 0
   const scanned: number[] = []
@@ -183,25 +313,13 @@ export async function loadPdf(buf: Uint8Array, opts: { ocr?: OcrFn; onOcrPage?: 
       for (let i = 0; i < count; i++) {
         const ents = results[i].entities
         const page = pageAt(i)
-        let removedAnnots = 0
 
-        // Annotations may carry sensitive text (comments, links to mailto:…) – drop the risky ones.
+        // Links to mailto:/tel: or containing a detected value would leak it.
         const values = ents.map((e) => e.text.toLowerCase())
-        for (const a of page.getAnnotations()) {
-          const type = a.getType()
-          if (['Text', 'FreeText', 'Popup', 'FileAttachment', 'Sound', 'Stamp', 'Ink'].includes(type)) {
-            const contents = (a.hasRect() ? a.getContents() : '') || ''
-            if (contents || type !== 'Popup') {
-              page.deleteAnnotation(a)
-              removedAnnots++
-            }
-          }
-        }
         for (const l of page.getLinks()) {
           const uri = l.getURI().toLowerCase()
           if (uri.startsWith('mailto:') || uri.startsWith('tel:') || values.some((v) => v && uri.includes(v))) page.deleteLink(l)
         }
-        if (removedAnnots) warnings.push(`Strana ${i + 1}: odstránených ${removedAnnots} poznámok/anotácií.`)
 
         if (!ents.length) continue
         const pt = pages[i]
@@ -242,12 +360,7 @@ export async function loadPdf(buf: Uint8Array, opts: { ocr?: OcrFn; onOcrPage?: 
         const box = (k: number) => {
           if (drawn.has(k)) return
           drawn.add(k)
-          const { rect, label } = overlays[k]
-          const [x0, y0, x1, y1] = rect
-          cs += `${BOX_RGB.join(' ')} rg ${n(x0)} ${n(y0)} ${n(x1 - x0)} ${n(y1 - y0)} re f\n`
-          if (!label) return
-          const g = labelGeometry(rect, label, widthAt1)
-          cs += `BT 0 Tr /FAnon ${n(g.size)} Tf ${INK_RGB.join(' ')} rg 1 0 0 -1 ${n(g.x)} ${n(g.y)} Tm ${pdfString(label)} Tj ET\n`
+          cs += boxOps(overlays[k].rect, overlays[k].label, widthAt1)
         }
         if (pt.ocr) {
           let runStart = -1
@@ -279,26 +392,9 @@ export async function loadPdf(buf: Uint8Array, opts: { ocr?: OcrFn; onOcrPage?: 
         overlays.forEach((_, k) => box(k))
         cs += 'Q\n'
 
-        const pageObj = page.getObject()
-        let res = pageObj.get('Resources')
-        if (res.isNull()) {
-          res = doc.newDictionary()
-          pageObj.put('Resources', res)
-        }
-        let fonts = res.get('Font')
-        if (fonts.isNull()) {
-          fonts = doc.newDictionary()
-          res.put('Font', fonts)
-        }
-        fonts.put('FAnon', (fontRef ??= doc.addSimpleFont(font, 'Latin')))
-        if (pt.ocr) fonts.put('FAnonU', (unicodeFontRef ??= doc.addFont(font)))
-        const contents = pageObj.get('Contents')
-        const arr = doc.newArray()
-        arr.push(doc.addStream('q\n', {}))
-        if (contents.isArray()) contents.forEach((c: MuPDF.PDFObject) => arr.push(c))
-        else if (!contents.isNull()) arr.push(contents)
-        arr.push(doc.addStream('Q\n' + cs, {}))
-        pageObj.put('Contents', arr)
+        const fonts: Record<string, MuPDF.PDFObject> = { FAnon: (fontRef ??= doc.addSimpleFont(font, 'Latin')) }
+        if (pt.ocr) fonts.FAnonU = unicodeFontRef ??= doc.addFont(font)
+        appendContent(doc, page, cs, fonts)
       }
 
       // Form field values

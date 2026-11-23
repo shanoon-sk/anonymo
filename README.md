@@ -1,6 +1,6 @@
 # Anonymo
 
-Desktop app (Windows, macOS, Linux) that anonymizes **PDF, Word (.docx) and Excel (.xlsx)** files
+Desktop app (Windows, macOS, Linux) that anonymizes **PDF, Word (.docx), Excel (.xlsx) and image (.jpg, .png)** files
 before an accountant pastes them into ChatGPT or Claude. Drag & drop, tick what to hide, click
 **Anonymizovať**. Everything runs **offline**: no API calls, no telemetry, nothing stored besides
 the anonymized output files.
@@ -19,9 +19,10 @@ inflections ("Novák / Nováka / Novákovi" → `[OSOBA_1]`), so the AI still un
 | Shell | Electron + electron-vite, TypeScript everywhere |
 | UI | React 19, Tailwind v4, colours/fonts from shanoon.sk, Slovak copy (`src/renderer/src/i18n.ts`) |
 | Detection | Presidio-style engine in TS: regex + checksum validators (rodné číslo, IČO, DIČ/IČ DPH, IBAN mod 97, Luhn…) + context words + offline NER (`Xenova/bert-base-multilingual-cased-ner-hrl`, int8 ONNX via Transformers.js) |
-| DOCX / XLSX | Direct OOXML (JSZip) rewriting, so formatting, formulas, charts and pivots survive. Also covers headers/footers, comments, tracked-change authors, hyperlinks, metadata, sheet names, pivot caches |
-| PDF | MuPDF (WASM): **true redaction** (text removed, not covered), placeholder drawn in place, metadata scrubbed, form fields anonymized, optional `.md` text export |
+| DOCX / XLSX | Direct OOXML (JSZip) rewriting, so formatting, formulas, charts and pivots survive. Also covers headers/footers, comments, tracked-change authors, hyperlinks, metadata, sheet names, pivot caches. Images (logos, signatures, stamps) are replaced by a same-size placeholder; the package thumbnail is dropped |
+| PDF | MuPDF (WASM): **true redaction** (text removed, not covered), placeholder drawn in place, metadata scrubbed, form fields anonymized, optional `.md` text export. Images smaller than the page (logos, signatures), signature/stamp annotations and digital signature fields are removed and boxed as `[OBRAZOK]`; a page-sized image (scan, background) stays and is reported |
 | OCR | tesseract.js with bundled Slovak + English data, for scanned pages; image pixels under the redaction are destroyed |
+| JPG / PNG | Loaded as a one-page scanned PDF (EXIF orientation applied), OCR'd and redacted like a scan, then rendered back to the same format and pixel size; EXIF metadata is not carried over |
 
 Processing runs in an Electron `utilityProcess` (`src/main/worker.ts`). The engine (`src/engine/`)
 is plain Node/TS with no Electron dependency.

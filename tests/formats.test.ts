@@ -119,6 +119,42 @@ function pdfText(buf: Uint8Array): string {
   return t
 }
 
+function solidImage(w: number, h: number, rgb: number[]) {
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceRGB, [0, 0, w, h], false)
+  const px = pix.getPixels()
+  for (let i = 0; i < w * h; i++) px.set(rgb, i * 3)
+  return new mupdf.Image(pix)
+}
+
+function renderRgb(buf: Uint8Array) {
+  const pix = mupdf.Document.openDocument(buf.slice(), 'application/pdf')
+    .loadPage(0)
+    .toPixmap(mupdf.Matrix.identity, mupdf.ColorSpace.DeviceRGB, false, true)
+  return { px: pix.getPixels(), w: pix.getWidth() }
+}
+
+/** Pixels in the box (page space, y down) that are clearly not white or the light placeholder colour. */
+function inked({ px, w }: { px: Uint8ClampedArray | Uint8Array; w: number }, x0: number, y0: number, x1: number, y1: number) {
+  let c = 0
+  for (let y = y0; y < y1; y++)
+    for (let x = x0; x < x1; x++) {
+      const i = (y * w + x) * 3
+      if (px[i] + px[i + 1] + px[i + 2] < 600) c++
+    }
+  return c
+}
+
+/** Pixels in the box (page space, y down) within ±40 of the colour `rgb`. */
+function colored({ px, w }: { px: Uint8ClampedArray | Uint8Array; w: number }, [x0, y0, x1, y1]: number[], rgb: number[]) {
+  let c = 0
+  for (let y = y0; y < y1; y++)
+    for (let x = x0; x < x1; x++) {
+      const i = (y * w + x) * 3
+      if (rgb.every((v, k) => Math.abs(px[i + k] - v) <= 40)) c++
+    }
+  return c
+}
+
 async function zipText(path: string): Promise<string> {
   const zip = await JSZip.loadAsync(await readFile(path))
   let all = ''
@@ -146,6 +182,57 @@ describe('DOCX', () => {
     // the result is still a valid zip with a document
     const zip = await JSZip.loadAsync(await readFile(res.outputs[0]))
     expect(zip.file('word/document.xml')).toBeTruthy()
+  })
+  it('replaces logos and signatures with a placeholder, drops the thumbnail and alt texts', async () => {
+    const input = join(dir, 'zmluva-logo.docx')
+    await makeDocx(input)
+    const zip = await JSZip.loadAsync(await readFile(input))
+    const LOGO = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4, 0xab, 0xcd]) // stands in for a JPEG
+    zip.file('word/media/image1.jpeg', LOGO)
+    zip.file('word/media/image2.png', new Uint8Array([0x89, 0x50, 0x4e, 0x47, 9, 9, 9]))
+    zip.file('docProps/thumbnail.jpeg', LOGO)
+    const ct = (await zip.file('[Content_Types].xml')!.async('string')).replace(
+      '<Default Extension="xml"',
+      '<Default Extension="jpeg" ContentType="image/jpeg"/><Override PartName="/docProps/thumbnail.jpeg" ContentType="image/jpeg"/><Default Extension="xml"'
+    )
+    zip.file('[Content_Types].xml', ct)
+    const rootRels = (await zip.file('_rels/.rels')!.async('string')).replace(
+      '</Relationships>',
+      '<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail" Target="docProps/thumbnail.jpeg"/></Relationships>'
+    )
+    zip.file('_rels/.rels', rootRels)
+    const IMG = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image'
+    const rels = (await zip.file('word/_rels/document.xml.rels')!.async('string')).replace(
+      '</Relationships>',
+      `<Relationship Id="rId7" Type="${IMG}" Target="media/image1.jpeg"/><Relationship Id="rId8" Type="${IMG}" Target="media/image2.png"/><Relationship Id="rId10" Type="${IMG}" Target="https://firma.sk/logo.png" TargetMode="External"/></Relationships>`
+    )
+    zip.file('word/_rels/document.xml.rels', rels)
+    const drawing = (id: string, descr: string) =>
+      `<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="952500" cy="476250"/><wp:docPr id="1" name="Obrázok 1" descr="${descr}" title="Logo"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:blipFill><a:blip r:embed="${id}"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>`
+    const docXml = (await zip.file('word/document.xml')!.async('string')).replace(
+      '<w:body>',
+      '<w:body>' + drawing('rId7', 'Logo Alfa Beta s.r.o.') + drawing('rId8', 'Podpis konateľa') + drawing('rId10', 'Logo')
+    )
+    zip.file('word/document.xml', docXml)
+    await writeFile(input, await zip.generateAsync({ type: 'uint8array' }))
+
+    const [res] = await processFiles([input], OPTS, null, {}, noop)
+    expect(res.error).toBeUndefined()
+    const out = await JSZip.loadAsync(await readFile(res.outputs[0]))
+    const files = Object.keys(out.files).filter((f) => !out.files[f].dir)
+    expect(files.filter((f) => f.includes('media/'))).toEqual(['word/media/anonymo.png'])
+    expect(files).not.toContain('docProps/thumbnail.jpeg')
+    const outRels = await out.file('word/_rels/document.xml.rels')!.async('string')
+    expect(outRels).not.toMatch(/image1|image2|firma\.sk|External"[^>]*\/relationships\/image|\/image"[^>]*External/)
+    expect(outRels.match(/Target="media\/anonymo\.png"/g)).toHaveLength(3)
+    expect(await out.file('_rels/.rels')!.async('string')).not.toContain('thumbnail')
+    const outCt = await out.file('[Content_Types].xml')!.async('string')
+    expect(outCt).toContain('Extension="png"')
+    expect(outCt).not.toContain('thumbnail')
+    const body = await out.file('word/document.xml')!.async('string')
+    expect(body).not.toMatch(/Alfa Beta|Podpis konate|title="Logo"/)
+    expect(body.match(/descr="\[OBRAZOK\]"/g)).toHaveLength(3)
+    expect(res.warnings.join(' ')).toContain('Odstránené obrázky (logá, podpisy, pečiatky): 3.')
   })
 })
 
@@ -194,6 +281,34 @@ describe('XLSX', () => {
     const f = wb.getWorksheet('Súhrn')!.getCell('A1').value as { formula: string }
     expect(f.formula).toBe("SUM('OSOBA_1'!E2:E3)")
     expect(wb.getWorksheet('Súhrn')!.getCell('A2').value).toBe('Spracovala [OSOBA_2]')
+  })
+  it('replaces images (logo, signature) with a placeholder', async () => {
+    const input = join(dir, 'vykaz-logo.xlsx')
+    const wb = new ExcelJS.Workbook()
+    const ws = wb.addWorksheet('Výkaz')
+    ws.addRow(['Meno', 'Suma'])
+    ws.addRow(['Peter Malý', 10])
+    const png = mupdf.Document.openDocument(makeTextPdfDoc(['Logo']).saveToBuffer('').asUint8Array().slice(), 'application/pdf')
+      .loadPage(0)
+      .toPixmap(mupdf.Matrix.scale(0.1, 0.1), mupdf.ColorSpace.DeviceRGB, false)
+      .asPNG()
+    const id = wb.addImage({ buffer: Buffer.from(png) as unknown as ExcelJS.Buffer, extension: 'png' })
+    ws.addImage(id, { tl: { col: 3, row: 0 }, ext: { width: 120, height: 40 } })
+    await wb.xlsx.writeFile(input)
+    const before = await JSZip.loadAsync(await readFile(input))
+    expect(Object.keys(before.files).some((f) => f.startsWith('xl/media/'))).toBe(true)
+
+    const [res] = await processFiles([input], OPTS, null, {}, noop)
+    expect(res.error).toBeUndefined()
+    const out = await JSZip.loadAsync(await readFile(res.outputs[0]))
+    const media = Object.keys(out.files).filter((f) => f.startsWith('xl/media/') && !out.files[f].dir)
+    expect(media).toEqual(['xl/media/anonymo.png'])
+    const drawingRels = Object.keys(out.files).find((f) => /^xl\/drawings\/_rels\/.*\.rels$/.test(f))!
+    expect(await out.file(drawingRels)!.async('string')).toContain('Target="../media/anonymo.png"')
+    // Still opens and reads
+    const wb2 = new ExcelJS.Workbook()
+    await wb2.xlsx.load((await readFile(res.outputs[0])) as unknown as ExcelJS.Buffer)
+    expect(wb2.worksheets[0].getImages()).toHaveLength(1)
   })
 })
 
@@ -350,6 +465,116 @@ describe('PDF', () => {
     expect(res.warnings.join(' ')).toContain('invoice.isdoc')
   })
 
+  // A logo or a signature identifies the company or the person just like their name does.
+  it('removes logos and signatures (images, Stamp/Ink annotations, signature fields), anonymizes FreeText', async () => {
+    const input = join(dir, 'podpisana-zmluva.pdf')
+    const doc = new mupdf.PDFDocument()
+    const font = doc.addSimpleFont(new mupdf.Font('Helvetica'), 'Latin')
+    const logo = doc.addImage(solidImage(40, 20, [200, 30, 30]))
+    // A scanned signature as a 1-bit stencil mask
+    const sig = doc.addRawStream('\xf0\x0f'.repeat(20), { Type: 'XObject', Subtype: 'Image', Width: 16, Height: 20, ImageMask: true, BitsPerComponent: 1 })
+    const res = doc.addObject({ Font: { F1: font }, XObject: { Logo: logo, Sig: sig } })
+    const content = [
+      'q 100 0 0 50 50 750 cm /Logo Do Q',
+      'BT /F1 14 Tf 50 700 Td (Odberatel: Jan Novak, ICO 35763469) Tj ET',
+      'BT /F1 14 Tf 50 650 Td (Dakujeme za spolupracu.) Tj ET',
+      'q 0 0 0.5 rg 100 0 0 50 300 100 cm /Sig Do Q'
+    ].join('\n')
+    doc.insertPage(-1, doc.addPage([0, 0, 595, 842], 0, res, content))
+    const page = doc.loadPage(0) as mupdf.PDFPage
+    const stamp = page.createAnnotation('Stamp')
+    stamp.setRect([50, 300, 200, 360])
+    stamp.setStampImage(solidImage(30, 10, [0, 120, 0]))
+    stamp.update()
+    const ink = page.createAnnotation('Ink')
+    ink.setInkList([[[300, 400], [350, 450], [400, 400]]])
+    ink.setColor([0, 0, 0])
+    ink.setBorderWidth(3)
+    ink.update()
+    const note = page.createAnnotation('Text')
+    note.setRect([500, 50, 520, 70])
+    note.setContents('Overit u Jan Novak')
+    note.setPopup([500, 80, 590, 150])
+    note.update()
+    const free = page.createAnnotation('FreeText')
+    free.setRect([50, 500, 400, 530])
+    free.setContents('Schvalil Jan Novak')
+    free.update()
+    page.setPageBox('MediaBox', [0, 0, 595, 842])
+    page.getObject().put('Thumb', doc.addImage(solidImage(8, 8, [200, 30, 30])))
+    await writeFile(input, doc.saveToBuffer('compress').asUint8Array())
+    const before = renderRgb(new Uint8Array(await readFile(input)))
+    expect(colored(before, [50, 42, 150, 92], [200, 30, 30])).toBeGreaterThan(4000) // logo
+    expect(colored(before, [300, 692, 400, 742], [0, 0, 128])).toBeGreaterThan(1000) // signature
+    expect(colored(before, [50, 300, 200, 360], [0, 120, 0])).toBeGreaterThan(4000) // stamp
+    expect(colored(before, [300, 390, 400, 450], [0, 0, 0])).toBeGreaterThan(200) // ink signature
+
+    const [r] = await processFiles([input], OPTS, null, {}, noop)
+    expect(r.error).toBeUndefined()
+    const bytes = new Uint8Array(await readFile(r.outputs[0]))
+    const after = renderRgb(bytes)
+    // (the placeholder box and its "[OBRAZOK]" label are drawn there now – look for the originals' colours)
+    expect(colored(after, [50, 42, 150, 92], [200, 30, 30])).toBe(0) // logo
+    expect(colored(after, [300, 692, 400, 742], [0, 0, 128])).toBe(0) // stencil signature
+    expect(colored(after, [50, 300, 200, 360], [0, 120, 0])).toBe(0) // stamp
+    expect(colored(after, [300, 390, 400, 450], [0, 0, 0])).toBe(0) // ink signature
+    const out = mupdf.Document.openDocument(bytes.slice(), 'application/pdf').asPDF()!
+    expect((out.loadPage(0) as mupdf.PDFPage).getAnnotations()).toEqual([])
+    expect(out.findPage(0).get('Thumb').isNull()).toBe(true)
+    let images = 0
+    for (let n = 1; n < out.countObjects(); n++) if (out.newIndirect(n).resolve().get('Subtype').asName() === 'Image') images++
+    expect(images).toBe(0)
+    const text = pdfText(bytes)
+    expect(text).toContain('Dakujeme za spolupracu.')
+    expect(text).toContain('Schvalil [OSOBA_1]')
+    expect(text).toContain('[OBRAZOK]')
+    const raw = Buffer.from(out.saveToBuffer('decompress').asUint8Array()).toString('latin1')
+    expect(raw).not.toMatch(/Novak|35763469|Overit/)
+    expect(r.warnings.join(' ')).toMatch(/obrázk/)
+  })
+
+  it('removes a digital signature field and its signer data', async () => {
+    const input = join(dir, 'podpis-pole.pdf')
+    const doc = makeTextPdfDoc(['Zmluva o dielo'])
+    const page = doc.loadPage(0) as mupdf.PDFPage
+    const w = page.createAnnotation('Widget')
+    w.setRect([300, 600, 500, 650])
+    const field = w.getObject()
+    field.put('FT', doc.newName('Sig'))
+    field.put('T', doc.newString('Podpis1'))
+    field.put('V', doc.addObject({ Type: 'Sig', Name: 'Jan Novak', Reason: 'Suhlasim' }))
+    const acro = doc.newDictionary()
+    const fields = doc.newArray()
+    fields.push(field)
+    acro.put('Fields', fields)
+    acro.put('SigFlags', 3)
+    doc.getTrailer().get('Root').put('AcroForm', acro)
+    await writeFile(input, doc.saveToBuffer('compress').asUint8Array())
+    const [r] = await processFiles([input], OPTS, null, {}, noop)
+    expect(r.error).toBeUndefined()
+    const out = mupdf.Document.openDocument(new Uint8Array(await readFile(r.outputs[0])), 'application/pdf').asPDF()!
+    expect((out.loadPage(0) as mupdf.PDFPage).getAnnotations()).toEqual([])
+    const raw = Buffer.from(out.saveToBuffer('decompress').asUint8Array()).toString('latin1')
+    expect(raw).not.toMatch(/Jan Novak|Suhlasim|\/FT\s*\/Sig/)
+  })
+
+  it('keeps a full-page scan but reports that logos/signatures inside it stay', async () => {
+    const input = join(dir, 'sken-s-textom.pdf')
+    const doc = new mupdf.PDFDocument()
+    const font = doc.addSimpleFont(new mupdf.Font('Helvetica'), 'Latin')
+    const scan = doc.addImage(solidImage(60, 80, [120, 120, 120]))
+    const res = doc.addObject({ Font: { F1: font }, XObject: { Scan: scan } })
+    // A "searchable scan": the page image plus an invisible OCR text layer
+    const content = `q 595 0 0 842 0 0 cm /Scan Do Q\nBT 3 Tr /F1 14 Tf 50 700 Td (Odberatel: Jan Novak, ICO 35763469) Tj ET`
+    doc.insertPage(-1, doc.addPage([0, 0, 595, 842], 0, res, content))
+    await writeFile(input, doc.saveToBuffer('compress').asUint8Array())
+    const [r] = await processFiles([input], OPTS, null, {}, noop)
+    expect(r.error).toBeUndefined()
+    const after = renderRgb(new Uint8Array(await readFile(r.outputs[0])))
+    expect(inked(after, 400, 400, 500, 500)).toBe(10000) // the scan itself is still there
+    expect(r.warnings.join(' ')).toMatch(/Strana 1.*sken/)
+  })
+
   it.skipIf(!hasTess)('OCRs scanned pages and redacts the image pixels', async () => {
     const input = join(dir, 'sken.pdf')
     await makeScannedPdf(input)
@@ -380,4 +605,70 @@ describe('PDF', () => {
       await engine.dispose()
     }
   })
+})
+
+describe('Images (JPG, PNG)', () => {
+  /** The invoice text rendered as a photo-like image, 200 DPI. */
+  function invoicePixmap() {
+    const scale = 200 / 72
+    return makeTextPdfDoc(PDF_LINES).loadPage(0).toPixmap(mupdf.Matrix.scale(scale, scale), mupdf.ColorSpace.DeviceRGB, false)
+  }
+
+  it('needs OCR, and says so instead of producing an unredacted copy', async () => {
+    const input = join(dir, 'foto.png')
+    await writeFile(input, invoicePixmap().asPNG())
+    const [res] = await processFiles([input], OPTS, null, {}, noop)
+    expect(res.error).toMatch(/OCR/)
+    expect(res.outputs).toEqual([])
+  })
+
+  it('applies the EXIF orientation of phone photos and drops the EXIF data', async () => {
+    const input = join(dir, 'foto-otocena.jpg')
+    const jpeg = invoicePixmap().asJPEG(90)
+    // APP1 Exif: Orientation = 6 (rotate 90° clockwise to display), plus a GPS-like marker string
+    const tiff = [0x49, 0x49, 0x2a, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0]
+    const marker = [...new TextEncoder().encode('GPSPOLOHA')]
+    const body = [...new TextEncoder().encode('Exif\0\0'), ...tiff, ...marker]
+    const app1 = [0xff, 0xe1, (body.length + 2) >> 8, (body.length + 2) & 0xff, ...body]
+    await writeFile(input, new Uint8Array([...jpeg.slice(0, 2), ...app1, ...jpeg.slice(2)]))
+    const [res] = await processFiles([input], OPTS, null, { ocr: async () => async () => [] }, noop)
+    expect(res.error).toBeUndefined()
+    const bytes = new Uint8Array(await readFile(res.outputs[0]))
+    const img = new mupdf.Image(bytes)
+    const src = invoicePixmap()
+    expect([img.getWidth(), img.getHeight()]).toEqual([src.getHeight(), src.getWidth()])
+    expect(Buffer.from(bytes).toString('latin1')).not.toMatch(/Exif|GPSPOLOHA/)
+  })
+
+  for (const ext of ['png', 'jpg'] as const)
+    it.skipIf(!hasTess)(`redacts the values in a .${ext}, keeps its size and format, and drops its metadata`, async () => {
+      const input = join(dir, `faktura-foto.${ext}`)
+      const pix = invoicePixmap()
+      await writeFile(input, ext === 'png' ? pix.asPNG() : pix.asJPEG(92))
+      const engine = await createOcr(tessdata)
+      try {
+        const [res] = await processFiles([input], OPTS, null, { ocr: async () => engine.ocr }, noop)
+        expect(res.error).toBeUndefined()
+        expect(res.ocrPages).toBe(1)
+        expect(res.outputs[0].endsWith(`_anonymizovane.${ext}`)).toBe(true)
+        // The text version (when asked for) carries the placeholders
+        const md = await readFile(res.outputs[1], 'utf8')
+        expect(md).toMatch(/\[ICO_1\]/)
+        expect(md).not.toContain('35763469')
+        const bytes = new Uint8Array(await readFile(res.outputs[0]))
+        // Same format (magic bytes) and pixel size
+        if (ext === 'png') expect([...bytes.slice(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47])
+        else expect([...bytes.slice(0, 2)]).toEqual([0xff, 0xd8])
+        const img = new mupdf.Image(bytes)
+        expect([img.getWidth(), img.getHeight()]).toEqual([pix.getWidth(), pix.getHeight()])
+        const again = (await engine.ocr(img.toPixmap().asPNG())).map((w) => w.text).join(' ')
+        expect(again).not.toContain('35763469')
+        expect(again).not.toMatch(/Novak/)
+        expect(again).toContain('2024015')
+        expect(res.warnings.join(' ')).toMatch(/logá a podpisy/i)
+        expect(res.warnings.join(' ')).not.toMatch(/Strana/)
+      } finally {
+        await engine.dispose()
+      }
+    })
 })
