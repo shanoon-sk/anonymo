@@ -3,7 +3,12 @@
 Desktop app (Windows, macOS, Linux) that anonymizes **PDF, Word (.docx), Excel (.xlsx) and image (.jpg, .png)** files
 before an accountant pastes them into ChatGPT or Claude. Drag & drop, tick what to hide, click
 **Anonymizovať**. Everything runs **offline**: no API calls, no telemetry, nothing stored besides
-the anonymized output files.
+the anonymized output files. The only network traffic is the update check against the download
+server, once per launch (`src/main/update.ts`): on Windows electron-updater reads `/latest.yml` and,
+when the user clicks *Aktualizovať*, downloads the new installer (only changed blocks, via the
+`.blockmap`), installs it silently and restarts; on macOS it reads `/latest.json` and the button
+opens the DMG in the browser (Squirrel.Mac needs a Developer ID signature). No document data is sent,
+nothing is downloaded without a click, and it is skipped in dev and in the Microsoft Store build.
 
 ```
 Ján Novák, r. č. 850101/0001, IBAN SK31 1200 …   →   [OSOBA_1], r. č. [RODNE_CISLO_1], IBAN [IBAN_1]

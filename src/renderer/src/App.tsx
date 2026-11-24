@@ -1,10 +1,12 @@
 import { Loader2, ShieldCheck, Sparkles } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { DEFAULT_SELECTED } from '../../shared/entities'
+import type { UpdateInfo } from '../../shared/update'
 import { sk } from './i18n'
 import { DropZone } from './components/DropZone'
 import { FileRow, type FileItem } from './components/FileList'
 import { OutputLocation, TypeSelector, type Options } from './components/OptionsPanel'
+import { UpdateButton } from './components/UpdateButton'
 import { AnonymoMark, Button, ShanoonMark } from './components/ui'
 
 const SUPPORTED = new Set(['pdf', 'docx', 'xlsx', 'xlsm', 'jpg', 'jpeg', 'png'])
@@ -25,6 +27,12 @@ export function App() {
     outDir: null
   })
   const [prefsLoaded, setPrefsLoaded] = useState(false)
+  const [update, setUpdate] = useState<UpdateInfo | null>(null)
+
+  // Offer a newer version if the download server has one. Failure (offline…) just shows nothing.
+  useEffect(() => {
+    window.anonymo.checkForUpdate().then(setUpdate, () => {})
+  }, [])
 
   // Restore remembered settings (types, output folder) on start…
   useEffect(() => {
@@ -106,10 +114,14 @@ export function App() {
             <p className="text-[12px] text-meta">{sk.by}</p>
           </div>
         </div>
-        <span className="inline-flex items-center gap-1.5 rounded-full border border-[color-mix(in_oklab,var(--primary)_25%,transparent)] bg-primary-light px-3 py-1 text-[12px] font-medium text-primary">
-          <ShieldCheck className="size-3.5" />
-          {sk.offlineBadge}
-        </span>
+        <div className="flex items-center gap-2">
+          {/* Restarting mid-batch would lose the run, so the in-app update waits until it finishes. */}
+          {update && <UpdateButton update={update} disabled={busy} />}
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-[color-mix(in_oklab,var(--primary)_25%,transparent)] bg-primary-light px-3 py-1 text-[12px] font-medium text-primary">
+            <ShieldCheck className="size-3.5" />
+            {sk.offlineBadge}
+          </span>
+        </div>
       </header>
 
       <div className="flex min-h-0 flex-1">

@@ -1,4 +1,5 @@
 import type { AnonymizeOptions, EntityType, FileResult, ProgressEvent } from './entities'
+import type { UpdateInfo } from './update'
 
 /** Remembered UI settings (no document data, no custom terms). */
 export interface Preferences {
@@ -22,6 +23,14 @@ export interface AnonymoApi {
   openShanoon(): Promise<void>
   loadPreferences(): Promise<Preferences | null>
   savePreferences(p: Preferences): Promise<void>
+  /** Newer version on the download server, or null (up to date, offline, dev, Store build). */
+  checkForUpdate(): Promise<UpdateInfo | null>
+  /** Opens the offered installer in the browser. No URL argument: main only opens what it offered. */
+  openUpdate(): Promise<void>
+  /** mode 'install' only: downloads the update and restarts into it. Rejects on failure. */
+  installUpdate(): Promise<void>
+  /** Download progress of installUpdate, 0–100. */
+  onUpdateProgress(cb: (percent: number) => void): () => void
   version: string
 }
 

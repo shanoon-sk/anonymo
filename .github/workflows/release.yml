@@ -84,6 +84,24 @@ jobs:
           sha256sum "$exe" "$dmg" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      # In-app updates on Windows (src/main/update.ts). electron-builder writes the installer's path in
+      # latest.yml relative to the feed; the worker serves the feed at / but the files under v<version>/.
+      # The blockmap lets the next version download only the blocks that changed.
+      - name: Prepare update feed
+        working-directory: release
+        run: |
+          for f in latest.yml "Anonymo-Setup-$VERSION.exe.blockmap"; do
+            [ -f "$f" ] || { echo "::error::missing $f"; ls -la; exit 1; }
+          done
+          node -e '
+            const fs = require("fs"), v = process.env.VERSION
+            const yml = fs.readFileSync("latest.yml", "utf8")
+            fs.writeFileSync("latest.yml", yml.replace(/^(\s*-?\s*url: |path: )Anonymo-Setup-/gm, `$1v${v}/Anonymo-Setup-`))
+          '
+          cat latest.yml
+          grep -q "^version: $VERSION$" latest.yml || { echo "::error::latest.yml is not for $VERSION"; exit 1; }
+          [ "$(grep -c "v$VERSION/Anonymo-Setup-$VERSION.exe" latest.yml)" -eq 2 ] || { echo "::error::latest.yml paths were not rewritten"; exit 1; }
+
       # Versioned paths are served as immutable, so never overwrite a release that is already live.
       - name: Refuse to overwrite an existing release
         run: |
@@ -96,7 +114,7 @@ jobs:
         working-directory: release
         run: |
           # Checksums last: the download page shows them, so they mark the release complete.
-          for f in "Anonymo-Setup-$VERSION.exe" "Anonymo-$VERSION-arm64.dmg" SHA256SUMS.txt; do
+          for f in "Anonymo-Setup-$VERSION.exe.blockmap" "Anonymo-Setup-$VERSION.exe" "Anonymo-$VERSION-arm64.dmg" latest.yml SHA256SUMS.txt; do
             npx -y "$WRANGLER" r2 object put "anonymo/v$VERSION/$f" --file "$f" --remote \
               --content-disposition "attachment; filename=\"$f\""
           done
@@ -114,3 +132,9 @@ jobs:
             case "$loc" in *"/v$VERSION/"*) ;; *) echo "::error::/$p does not point at v$VERSION"; exit 1;; esac
             curl -sfI "$loc" > /dev/null || { echo "::error::$loc is not served"; exit 1; }
           done
+          # The app offers updates from these (src/main/update.ts): latest.json on macOS, latest.yml on Windows.
+          latest=$(curl -sf "$base/latest.json" | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")
+          echo "/latest.json → $latest"
+          [ "$latest" = "$VERSION" ] || { echo "::error::/latest.json says $latest, expected $VERSION"; exit 1; }
+          curl -sf "$base/latest.yml" | grep -q "^version: $VERSION$" || { echo "::error::/latest.yml is not for $VERSION"; exit 1; }
+          curl -sfI "$base/v$VERSION/Anonymo-Setup-$VERSION.exe.blockmap" > /dev/null || { echo "::error::blockmap is not served"; exit 1; }

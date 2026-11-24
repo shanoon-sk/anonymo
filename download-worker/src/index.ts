@@ -2,6 +2,8 @@
 // Routes:  /            → download page (Slovak)
 //          /windows     → latest Windows installer
 //          /mac         → latest macOS (Apple Silicon) installer
+//          /latest.json → current version + installer links, read by the app on macOS to offer an update
+//          /latest.yml  → electron-updater feed for in-app updates on Windows
 //          /v0.1.0/...  → exact files (supports HEAD and Range for resumable downloads)
 
 interface Env {
@@ -15,7 +17,8 @@ interface Env {
 const files = (version: string) => ({
   windows: `v${version}/Anonymo-Setup-${version}.exe`,
   mac: `v${version}/Anonymo-${version}-arm64.dmg`,
-  sums: `v${version}/SHA256SUMS.txt`
+  sums: `v${version}/SHA256SUMS.txt`,
+  updater: `v${version}/latest.yml`
 })
 
 export default {
@@ -28,6 +31,22 @@ export default {
     if (path === '') return page(req, env)
     if (path === 'sukromie' || path === 'privacy') return privacy(req)
     if (path === 'windows' || path === 'mac') return Response.redirect(`${url.origin}/${FILES[path]}`, 302)
+    // Read by the app once per launch (src/main/update.ts) to offer a newer version.
+    if (path === 'latest.json') {
+      const body = { version: env.VERSION, windows: `${url.origin}/${FILES.windows}`, mac: `${url.origin}/${FILES.mac}` }
+      return new Response(req.method === 'HEAD' ? null : JSON.stringify(body), {
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'public, max-age=300', 'x-content-type-options': 'nosniff' }
+      })
+    }
+    // electron-updater on Windows (src/main/update.ts). release.yml uploads it with its paths already
+    // pointing into v<version>/, so the installer and blockmaps are served by the route below.
+    if (path === 'latest.yml') {
+      const obj = await env.RELEASES.get(FILES.updater)
+      if (!obj) return new Response('Nenájdené', { status: 404 })
+      return new Response(req.method === 'HEAD' ? null : obj.body, {
+        headers: { 'content-type': 'text/yaml; charset=utf-8', 'cache-control': 'public, max-age=300', 'x-content-type-options': 'nosniff' }
+      })
+    }
     if (path === 'favicon.ico' || path === 'favicon.svg') return new Response(ICON, { headers: { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400' } })
     if (!/^v\d+\.\d+\.\d+\/[\w.\-]+$/.test(path)) return new Response('Nenájdené', { status: 404 })
 
@@ -144,7 +163,7 @@ ${STYLE}
 </head><body><div class="wrap doc">
 <header>${ICON}<div><h1>Anonymo</h1><p>by Shanoon</p></div></header>
 <p class="lead">Zásady ochrany súkromia</p>
-<p class="sub">Platné od 2. 11. 2026 pre aplikáciu Anonymo (Windows, macOS).</p>
+<p class="sub">Platné od 24. 11. 2026 pre aplikáciu Anonymo (Windows, macOS).</p>
 
 <h2>Stručne</h2>
 <p>Aplikácia spracúva vaše dokumenty výlučne na vašom počítači. Žiadne dokumenty, ich obsah ani nájdené údaje sa nikam neodosielajú a aplikácia neobsahuje žiadnu analytiku, telemetriu ani reklamu.</p>
@@ -159,6 +178,7 @@ ${STYLE}
 
 <h2>Sieť</h2>
 <p>Aplikácia na spracovanie nepotrebuje internet a sieťovú komunikáciu aktívne blokuje. Rozpoznávanie mien (AI model) aj rozpoznávanie textu v naskenovaných PDF (OCR) sú súčasťou inštalácie a bežia lokálne. Model sa na vašich dokumentoch nič neučí. Jediný odkaz von je odkaz „Powered by Shanoon“, ktorý na vaše kliknutie otvorí web shanoon.sk v prehliadači.</p>
+<p><b>Aktualizácie.</b> Pri spustení si aplikácia raz načíta z tejto stránky malý súbor s číslom najnovšej verzie. Požiadavka neobsahuje žiadne dokumenty, ich obsah, nastavenia ani identifikátor zariadenia; server pri nej technicky vidí iba vašu IP adresu (pozri nižšie). Ak je k dispozícii novšia verzia, aplikácia zobrazí tlačidlo. Na Windows ho stlačením novú verziu stiahnete z tejto stránky a aplikácia sa reštartuje už aktualizovaná; na Macu tlačidlo otvorí stiahnutie v prehliadači. Bez vášho kliknutia sa nič nesťahuje ani neinštaluje. Verzia z Microsoft Store túto kontrolu nerobí, aktualizácie zabezpečuje Store.</p>
 
 <h2>Táto stránka na stiahnutie</h2>
 <p>Stránku a súbory na stiahnutie prevádzkuje Cloudflare. Ako každý webový server môže pri návšteve technicky spracovať vašu IP adresu a údaje o prehliadači na účely doručenia a ochrany pred zneužitím. Nepoužívame žiadne cookies ani analytické nástroje.</p>

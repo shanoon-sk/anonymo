@@ -17,6 +17,14 @@ const api: AnonymoApi = {
   openShanoon: () => ipcRenderer.invoke('open-shanoon'),
   loadPreferences: () => ipcRenderer.invoke('prefs-load'),
   savePreferences: (p) => ipcRenderer.invoke('prefs-save', p),
+  checkForUpdate: () => ipcRenderer.invoke('check-update'),
+  openUpdate: () => ipcRenderer.invoke('open-update'),
+  installUpdate: () => ipcRenderer.invoke('install-update'),
+  onUpdateProgress: (cb) => {
+    const h = (_e: unknown, percent: number) => cb(percent)
+    ipcRenderer.on('update-progress', h)
+    return () => ipcRenderer.removeListener('update-progress', h)
+  },
   version: __APP_VERSION__
 }
 

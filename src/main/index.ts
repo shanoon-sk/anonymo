@@ -5,6 +5,7 @@ import type { WorkerRequest, WorkerResponse } from '../shared/ipc'
 import type { Preferences } from '../shared/ipc'
 import { loadPreferences, savePreferences } from './preferences'
 import { applyPrivacySwitches, hardenWebContents, lockDownNetwork, wipeSessionData } from './privacy'
+import { checkForUpdate, installUpdate, offeredUrl } from './update'
 
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
 const SHANOON_URL = 'https://shanoon.sk'
@@ -163,6 +164,12 @@ ipcMain.handle('open-file', async (_e, p: string) => void (await shell.openPath(
 ipcMain.handle('open-shanoon', () => shell.openExternal(SHANOON_URL))
 ipcMain.handle('prefs-load', () => loadPreferences())
 ipcMain.handle('prefs-save', (_e, p: Preferences) => savePreferences(p))
+ipcMain.handle('check-update', () => checkForUpdate())
+ipcMain.handle('open-update', async () => {
+  const url = await offeredUrl()
+  if (url) await shell.openExternal(url)
+})
+ipcMain.handle('install-update', () => installUpdate((percent) => win?.webContents.send('update-progress', percent)))
 
 app.on('second-instance', () => {
   if (win) {

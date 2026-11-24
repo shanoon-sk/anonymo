@@ -44,8 +44,11 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: installer-${{ matrix.os }}
+          # latest.yml + blockmap: the Windows in-app update feed (release.yml uploads them to R2)
           path: |
             dist/*.exe
+            dist/*.exe.blockmap
+            dist/latest.yml
             dist/*.AppImage
 
   # Microsoft Store package (MSIX/AppX). Needs the Partner Center identity values in electron-builder.yml.

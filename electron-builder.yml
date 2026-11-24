@@ -95,4 +95,11 @@ linux:
 # Removes ONNX runtime binaries for other platforms/architectures (~200 MB)
 afterPack: scripts/after-pack.cjs
 
-publish: null
+# In-app updates on Windows (electron-updater, src/main/update.ts). This only makes the build emit
+# latest.yml + the .exe.blockmap and embed app-update.yml; nothing is published by electron-builder
+# (scripts pass --publish never). release.yml uploads them to R2 and the download worker serves
+# /latest.yml. The worker answers single byte ranges only, hence useMultipleRangeRequest: false.
+publish:
+  provider: generic
+  url: https://anonymo.shanoon.workers.dev
+  useMultipleRangeRequest: false
