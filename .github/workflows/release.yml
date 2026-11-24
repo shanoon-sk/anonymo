@@ -1,11 +1,13 @@
 name: Release
 
-# Push a tag `v<version>` matching package.json → installers are built, uploaded to the R2 bucket
-# `anonymo` under v<version>/, and the download worker is redeployed to point /windows and /mac at
-# them (https://anonymo.shanoon.workers.dev).
+# Push a tag `v<version>` matching package.json → installers are built and uploaded to the R2 bucket
+# `anonymo` under v<version>/, then the object `current-version` is switched to <version>, which is
+# what the download worker (https://anonymo.shanoon.workers.dev) serves. The worker itself is not
+# redeployed here; deploy it by hand (`npx wrangler deploy` in download-worker/) when its code changes.
 #
-# Needs repository (or `release` environment) secrets:
-#   CLOUDFLARE_API_TOKEN   – token with "Workers R2 Storage: Edit" and "Workers Scripts: Edit"
+# Needs repository (or `release` environment) secrets, from an R2 API token limited to Object Read &
+# Write on the `anonymo` bucket only (R2 → Manage R2 API Tokens):
+#   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
 #   CLOUDFLARE_ACCOUNT_ID
 
 on:
@@ -55,9 +57,14 @@ jobs:
     environment: release
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      WRANGLER: wrangler@4.154.0
+      # R2's S3 API with a bucket-scoped token (aws CLI is preinstalled on ubuntu runners). No
+      # per-object size cap, unlike `wrangler r2 object put` (300 MiB); the cli switches to multipart.
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+      AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
+      R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -78,8 +85,6 @@ jobs:
           dmg="Anonymo-$VERSION-arm64.dmg"
           for f in "$exe" "$dmg"; do
             [ -f "$f" ] || { echo "::error::missing $f"; ls -la; exit 1; }
-            # wrangler r2 object put is limited to 300 MiB
-            [ "$(stat -c %s "$f")" -lt 314572800 ] || { echo "::error::$f is over 300 MiB"; exit 1; }
           done
           sha256sum "$exe" "$dmg" > SHA256SUMS.txt
           cat SHA256SUMS.txt
@@ -105,23 +110,28 @@ jobs:
       # Versioned paths are served as immutable, so never overwrite a release that is already live.
       - name: Refuse to overwrite an existing release
         run: |
-          if npx -y "$WRANGLER" r2 object get "anonymo/v$VERSION/SHA256SUMS.txt" --remote --pipe > /dev/null 2>&1; then
+          if aws s3api head-object --endpoint-url "$R2_ENDPOINT" --bucket anonymo --key "v$VERSION/SHA256SUMS.txt" > /dev/null 2>&1; then
             echo "::error::v$VERSION is already in R2 — bump the version"
             exit 1
           fi
+          # …and fail here, not halfway through the upload, if the credentials are wrong.
+          aws s3api list-objects-v2 --endpoint-url "$R2_ENDPOINT" --bucket anonymo --prefix v --max-items 1 > /dev/null
 
       - name: Upload to R2
         working-directory: release
         run: |
           # Checksums last: the download page shows them, so they mark the release complete.
           for f in "Anonymo-Setup-$VERSION.exe.blockmap" "Anonymo-Setup-$VERSION.exe" "Anonymo-$VERSION-arm64.dmg" latest.yml SHA256SUMS.txt; do
-            npx -y "$WRANGLER" r2 object put "anonymo/v$VERSION/$f" --file "$f" --remote \
+            aws s3 cp "$f" "s3://anonymo/v$VERSION/$f" --endpoint-url "$R2_ENDPOINT" --only-show-errors \
               --content-disposition "attachment; filename=\"$f\""
           done
 
-      - name: Deploy download worker
-        working-directory: download-worker
-        run: npx -y "$WRANGLER" deploy --var "VERSION:$VERSION"
+      # Only now, with every file in place, do /windows, /mac and the update feeds move to the new version.
+      - name: Switch current version
+        run: |
+          printf '%s' "$VERSION" > current-version
+          aws s3 cp current-version s3://anonymo/current-version --endpoint-url "$R2_ENDPOINT" --only-show-errors \
+            --content-type text/plain --cache-control no-store
 
       - name: Smoke test
         run: |

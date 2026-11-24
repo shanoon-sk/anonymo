@@ -7,3 +7,4 @@ resources/tessdata/
 *.log
 .DS_Store
 .wrangler/
+.env

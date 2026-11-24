@@ -8,5 +8,5 @@ preview_urls = false
 binding = "RELEASES"
 bucket_name = "anonymo"
 
-[vars]
-VERSION = "0.1.4"
+# The current release is not a var: the worker reads it from the R2 object `current-version`,
+# which .github/workflows/release.yml writes. Deploy only when this worker's code changes.

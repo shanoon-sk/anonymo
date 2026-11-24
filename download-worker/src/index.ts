@@ -8,9 +8,6 @@
 
 interface Env {
   RELEASES: R2Bucket
-  // The release /windows and /mac point at. Set by the release workflow (`wrangler deploy --var`);
-  // wrangler.toml holds the value for a manual deploy.
-  VERSION: string
 }
 
 // Files are uploaded to R2 under v<version>/ by .github/workflows/release.yml.
@@ -21,69 +18,87 @@ const files = (version: string) => ({
   updater: `v${version}/latest.yml`
 })
 
+/**
+ * The release that /windows, /mac, the page and the update feeds point at. release.yml writes this
+ * object last, after every file of the release is in place, so switching versions is one R2 write and
+ * the worker is never redeployed for a release (the CI token can only touch this bucket).
+ */
+const CURRENT = 'current-version'
+
+async function currentVersion(env: Env): Promise<string | null> {
+  const obj = await env.RELEASES.get(CURRENT)
+  const v = obj ? (await obj.text()).trim() : ''
+  return /^\d+\.\d+\.\d+$/.test(v) ? v : null
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     if (req.method !== 'GET' && req.method !== 'HEAD') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET, HEAD' } })
     const url = new URL(req.url)
     const path = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
 
-    const FILES = files(env.VERSION)
-    if (path === '') return page(req, env)
     if (path === 'sukromie' || path === 'privacy') return privacy(req)
+    if (path === 'favicon.ico' || path === 'favicon.svg') return new Response(ICON, { headers: { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400' } })
+    if (/^v\d+\.\d+\.\d+\/[\w.\-]+$/.test(path)) return file(req, env, path)
+    if (!['', 'windows', 'mac', 'latest.json', 'latest.yml'].includes(path)) return new Response('Nenájdené', { status: 404 })
+
+    const version = await currentVersion(env)
+    if (!version) return new Response('Momentálne nie je k dispozícii žiadna verzia.', { status: 503, headers: { 'retry-after': '300' } })
+    const FILES = files(version)
+    if (path === '') return page(req, env, version)
     if (path === 'windows' || path === 'mac') return Response.redirect(`${url.origin}/${FILES[path]}`, 302)
-    // Read by the app once per launch (src/main/update.ts) to offer a newer version.
+    // Read by the app once per launch on macOS (src/main/update.ts) to offer a newer version.
     if (path === 'latest.json') {
-      const body = { version: env.VERSION, windows: `${url.origin}/${FILES.windows}`, mac: `${url.origin}/${FILES.mac}` }
+      const body = { version, windows: `${url.origin}/${FILES.windows}`, mac: `${url.origin}/${FILES.mac}` }
       return new Response(req.method === 'HEAD' ? null : JSON.stringify(body), {
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'public, max-age=300', 'x-content-type-options': 'nosniff' }
       })
     }
     // electron-updater on Windows (src/main/update.ts). release.yml uploads it with its paths already
-    // pointing into v<version>/, so the installer and blockmaps are served by the route below.
-    if (path === 'latest.yml') {
-      const obj = await env.RELEASES.get(FILES.updater)
-      if (!obj) return new Response('Nenájdené', { status: 404 })
-      return new Response(req.method === 'HEAD' ? null : obj.body, {
-        headers: { 'content-type': 'text/yaml; charset=utf-8', 'cache-control': 'public, max-age=300', 'x-content-type-options': 'nosniff' }
-      })
-    }
-    if (path === 'favicon.ico' || path === 'favicon.svg') return new Response(ICON, { headers: { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400' } })
-    if (!/^v\d+\.\d+\.\d+\/[\w.\-]+$/.test(path)) return new Response('Nenájdené', { status: 404 })
-
-    const range = parseRange(req.headers.get('range'))
-    const obj = req.method === 'HEAD' ? await env.RELEASES.head(path) : await env.RELEASES.get(path, range ? { range } : {})
+    // pointing into v<version>/, so the installer and blockmaps are served by file().
+    const obj = await env.RELEASES.get(FILES.updater)
     if (!obj) return new Response('Nenájdené', { status: 404 })
-
-    const headers = new Headers()
-    obj.writeHttpMetadata(headers)
-    headers.set('etag', obj.httpEtag)
-    headers.set('accept-ranges', 'bytes')
-    // Versioned paths never change → cache aggressively at the edge and in browsers.
-    headers.set('cache-control', 'public, max-age=31536000, immutable')
-    headers.set('x-content-type-options', 'nosniff')
-
-    if (req.method === 'HEAD') {
-      headers.set('content-length', String(obj.size))
-      return new Response(null, { headers })
-    }
-    const body = (obj as R2ObjectBody).body
-    if (range && 'offset' in range && range.offset !== undefined) {
-      const start = range.offset
-      const end = range.length !== undefined ? start + range.length - 1 : obj.size - 1
-      headers.set('content-range', `bytes ${start}-${end}/${obj.size}`)
-      headers.set('content-length', String(end - start + 1))
-      return new Response(body, { status: 206, headers })
-    }
-    if (range && 'suffix' in range) {
-      const start = Math.max(0, obj.size - range.suffix)
-      headers.set('content-range', `bytes ${start}-${obj.size - 1}/${obj.size}`)
-      headers.set('content-length', String(obj.size - start))
-      return new Response(body, { status: 206, headers })
-    }
-    headers.set('content-length', String(obj.size))
-    return new Response(body, { headers })
+    return new Response(req.method === 'HEAD' ? null : obj.body, {
+      headers: { 'content-type': 'text/yaml; charset=utf-8', 'cache-control': 'public, max-age=300', 'x-content-type-options': 'nosniff' }
+    })
   }
 } satisfies ExportedHandler<Env>
+
+/** An exact file of a release, v<version>/<name>. */
+async function file(req: Request, env: Env, path: string): Promise<Response> {
+  const range = parseRange(req.headers.get('range'))
+  const obj = req.method === 'HEAD' ? await env.RELEASES.head(path) : await env.RELEASES.get(path, range ? { range } : {})
+  if (!obj) return new Response('Nenájdené', { status: 404 })
+
+  const headers = new Headers()
+  obj.writeHttpMetadata(headers)
+  headers.set('etag', obj.httpEtag)
+  headers.set('accept-ranges', 'bytes')
+  // Versioned paths never change → cache aggressively at the edge and in browsers.
+  headers.set('cache-control', 'public, max-age=31536000, immutable')
+  headers.set('x-content-type-options', 'nosniff')
+
+  if (req.method === 'HEAD') {
+    headers.set('content-length', String(obj.size))
+    return new Response(null, { headers })
+  }
+  const body = (obj as R2ObjectBody).body
+  if (range && 'offset' in range && range.offset !== undefined) {
+    const start = range.offset
+    const end = range.length !== undefined ? start + range.length - 1 : obj.size - 1
+    headers.set('content-range', `bytes ${start}-${end}/${obj.size}`)
+    headers.set('content-length', String(end - start + 1))
+    return new Response(body, { status: 206, headers })
+  }
+  if (range && 'suffix' in range) {
+    const start = Math.max(0, obj.size - range.suffix)
+    headers.set('content-range', `bytes ${start}-${obj.size - 1}/${obj.size}`)
+    headers.set('content-length', String(obj.size - start))
+    return new Response(body, { status: 206, headers })
+  }
+  headers.set('content-length', String(obj.size))
+  return new Response(body, { headers })
+}
 
 function parseRange(h: string | null): R2Range | undefined {
   const m = h && /^bytes=(\d*)-(\d*)$/.exec(h.trim())
@@ -95,8 +110,7 @@ function parseRange(h: string | null): R2Range | undefined {
 
 const mb = (n: number) => `${Math.round(n / 1e6)} MB`
 
-async function page(req: Request, env: Env): Promise<Response> {
-  const VERSION = env.VERSION
+async function page(req: Request, env: Env, VERSION: string): Promise<Response> {
   const FILES = files(VERSION)
   const [win, mac, sums] = await Promise.all([env.RELEASES.head(FILES.windows), env.RELEASES.head(FILES.mac), env.RELEASES.get(FILES.sums)])
   const sumsText = sums ? await sums.text() : ''
